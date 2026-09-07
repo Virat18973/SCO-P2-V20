@@ -286,6 +286,68 @@ def get_default_chemistry():
 # ============================================================================
 # HELPERS
 # ============================================================================
+# ============================================================================
+# R/S SHORTFALL COMPENSATION
+# ============================================================================
+# The normal user-selected R/S split remains strict when the required IOL
+# Fines and BF Returns quantities are physically available.
+#
+# If either source is unavailable or its inventory/Tech Max cannot support its
+# nominal share for the requested production, the model enters R/S shortfall
+# compensation mode. The physically usable R/S is consumed first and the
+# missing R/S is compensated by the iron-bearing burden through the LP's
+# existing chemistry, inventory, Tech Min/Max, flux and thermal constraints.
+RS_SHORTFALL_COMPENSATION_ENABLED = True
+RS_SHORTFALL_TOLERANCE_KG_T = 0.01
+RS_SHORTFALL_MAX_IRON_ORE_PORTION = 0.95
+
+
+def _rs_source_capacity_kg_t(df, mat, nominal_pct, production_tonnes):
+    """Return the maximum usable nominal-share quantity of an R/S source, kg/t."""
+    if mat not in df.index:
+        return 0.0
+    available_t = max(float(df.loc[mat, "Available_Tonnes"]), 0.0)
+    tech_max = max(float(df.loc[mat, "Tech_Max"]), 0.0)
+    if available_t <= 0.0 or tech_max <= 0.0:
+        return 0.0
+    nominal_kg_t = float(nominal_pct) * 1000.0
+    inventory_cap = (available_t / max(float(production_tonnes), 1e-12)) * 1000.0
+    return max(0.0, min(nominal_kg_t, tech_max, inventory_cap))
+
+
+def get_rs_shortfall_info(df, production_tonnes,
+                          iol_nominal=IOL_FINES_NOMINAL_PCT,
+                          bf_nominal=BF_RETURNS_NOMINAL_PCT):
+    """Calculate normal R/S target, usable source capacities and shortfall."""
+    iol_target = float(iol_nominal) * 1000.0
+    bfr_target = float(bf_nominal) * 1000.0
+    iol_cap = _rs_source_capacity_kg_t(df, "IOL_Fines", iol_nominal, production_tonnes)
+    bfr_cap = _rs_source_capacity_kg_t(df, "BF_Returns", bf_nominal, production_tonnes)
+    target = iol_target + bfr_target
+    available = iol_cap + bfr_cap
+    shortfall = max(0.0, target - available)
+    return {
+        "iol_target_kg_t": iol_target,
+        "bfr_target_kg_t": bfr_target,
+        "rs_target_kg_t": target,
+        "iol_capacity_kg_t": iol_cap,
+        "bfr_capacity_kg_t": bfr_cap,
+        "rs_available_kg_t": available,
+        "rs_shortfall_kg_t": shortfall,
+        "iol_shortfall_kg_t": max(0.0, iol_target - iol_cap),
+        "bfr_shortfall_kg_t": max(0.0, bfr_target - bfr_cap),
+        "active": bool(shortfall > RS_SHORTFALL_TOLERANCE_KG_T),
+    }
+
+
+def _rs_source_is_available(df, mat):
+    return (
+        mat in df.index
+        and float(df.loc[mat, "Available_Tonnes"]) > 0.0
+        and float(df.loc[mat, "Tech_Max"]) > 0.0
+    )
+
+
 def get_mandate_shortfall_triggers(df):
     triggers = 0
     reasons = []
@@ -359,16 +421,52 @@ def build_bounds(df, production_tonnes):
 def add_mandate_constraints(prob, x, df, OUT, mandate_mode="pinned",
                              iol_nominal=IOL_FINES_NOMINAL_PCT, bf_nominal=BF_RETURNS_NOMINAL_PCT,
                              iol_fb_min=IOL_FINES_FALLBACK_MIN, iol_fb_max=IOL_FINES_FALLBACK_MAX,
-                             bf_fb_min=BF_RETURNS_FALLBACK_MIN, bf_fb_max=BF_RETURNS_FALLBACK_MAX):
+                             bf_fb_min=BF_RETURNS_FALLBACK_MIN, bf_fb_max=BF_RETURNS_FALLBACK_MAX,
+                             rs_shortfall_active=False, rs_source_caps=None):
+    """
+    Apply the IOL/BF Returns burden rules.
+
+    Normal operation:
+        IOL Fines = iol_nominal of total burden
+        BF Returns = bf_nominal of total burden
+        Combined R/S = (iol_nominal + bf_nominal) of total burden
+
+    R/S-shortfall operation:
+        Each source is capped at its physically usable quantity. The missing
+        R/S is deliberately NOT forced into the LP. This prevents the model
+        from demanding material that is not in stock and allows the iron-
+        bearing compensation logic to rebalance the burden.
+    """
     total_burden = pulp.lpSum(x[m] for m in df.index)
-    for mat, nominal, fb_min, fb_max in [("IOL_Fines", iol_nominal, iol_fb_min, iol_fb_max),
-                                          ("BF_Returns", bf_nominal, bf_fb_min, bf_fb_max)]:
+    rs_source_caps = rs_source_caps or {}
+
+    if rs_shortfall_active:
+        # Use every physically available part of the nominal R/S allocation.
+        # The variable upper bound already enforces inventory; the explicit
+        # upper/lower bound here also prevents the cost objective from
+        # voluntarily leaving available R/S unused during a shortage.
+        if "IOL_Fines" in x:
+            cap = float(rs_source_caps.get("IOL_Fines", 0.0))
+            prob += x["IOL_Fines"] == min(cap, float(iol_nominal) * OUT), "IOL_Fines_RS_Shortfall_Use"
+        if "BF_Returns" in x:
+            cap = float(rs_source_caps.get("BF_Returns", 0.0))
+            prob += x["BF_Returns"] == min(cap, float(bf_nominal) * OUT), "BF_Returns_RS_Shortfall_Use"
+        # No combined 25% equality here: the difference is the explicit
+        # R/S shortfall and is compensated through iron-bearing materials.
+        return
+
+    # Normal case: preserve the existing strict split.
+    for mat, nominal in [("IOL_Fines", iol_nominal), ("BF_Returns", bf_nominal)]:
         if mat not in x:
             continue
         prob += x[mat] == nominal * total_burden, f"{mat}_STRICT_BURDEN_PCT"
+
     if "IOL_Fines" in x and "BF_Returns" in x:
         combined_nominal = iol_nominal + bf_nominal
-        prob += (x["IOL_Fines"] + x["BF_Returns"] == combined_nominal * total_burden), "RETURN_SINTER_TOTAL_STRICT"
+        prob += (
+            x["IOL_Fines"] + x["BF_Returns"]
+            == combined_nominal * total_burden
+        ), "RETURN_SINTER_TOTAL_STRICT"
 
 
 def add_structural_constraints(prob, x, df, bounds, iron_ores, fluxes, iron_ore_max_pct,
@@ -378,7 +476,7 @@ def add_structural_constraints(prob, x, df, bounds, iron_ores, fluxes, iron_ore_
                                 iol_nominal=IOL_FINES_NOMINAL_PCT, bf_nominal=BF_RETURNS_NOMINAL_PCT,
                                 iol_fb_min=IOL_FINES_FALLBACK_MIN, iol_fb_max=IOL_FINES_FALLBACK_MAX,
                                 bf_fb_min=BF_RETURNS_FALLBACK_MIN, bf_fb_max=BF_RETURNS_FALLBACK_MAX,
-                                fuel_ash_settings=None):
+                                fuel_ash_settings=None, rs_shortfall_active=False, rs_source_caps=None):
     non_fuel = [m for m in x if df.loc[m, "Group"] != "Fuel"]
     mass = pulp.lpSum(x[m] * (1 - df.loc[m, "LOI"] / 100) for m in non_fuel)
     ash_coeff = _fuel_ash_coefficients(df, fuel_ash_settings)
@@ -406,7 +504,13 @@ def add_structural_constraints(prob, x, df, bounds, iron_ores, fluxes, iron_ore_
         prob += x["MILL_SCALE"] >= MILL_SCALE_MIN_BURDEN_PCT * total_burden, "MILL_SCALE_Burden_Min"
         prob += x["MILL_SCALE"] <= MILL_SCALE_MAX_BURDEN_PCT * total_burden, "MILL_SCALE_Burden_Max"
 
-    iron_ore_portion_cap = MAX_IRON_ORE_PORTION_CRISIS if iron_tier == "crisis" else MAX_IRON_ORE_PORTION
+    # R/S shortfall compensation may require additional iron-bearing burden.
+    # Allow up to the approved 95% common iron-ore ceiling in this mode; this
+    # is a maximum, not a target. The LP still decides the actual blend.
+    if rs_shortfall_active:
+        iron_ore_portion_cap = RS_SHORTFALL_MAX_IRON_ORE_PORTION
+    else:
+        iron_ore_portion_cap = MAX_IRON_ORE_PORTION_CRISIS if iron_tier == "crisis" else MAX_IRON_ORE_PORTION
     prob += total_iron_ore <= iron_ore_portion_cap * OUT, "Max_Iron_Ore_Portion"
 
     min_pct_source = flux_min_pct_override if flux_min_pct_override is not None else FLUX_MIN_PCT
@@ -431,7 +535,8 @@ def add_structural_constraints(prob, x, df, bounds, iron_ores, fluxes, iron_ore_
 
     add_mandate_constraints(prob, x, df, OUT, mandate_mode=mandate_mode, iol_nominal=iol_nominal,
                              bf_nominal=bf_nominal, iol_fb_min=iol_fb_min, iol_fb_max=iol_fb_max,
-                             bf_fb_min=bf_fb_min, bf_fb_max=bf_fb_max)
+                             bf_fb_min=bf_fb_min, bf_fb_max=bf_fb_max,
+                             rs_shortfall_active=rs_shortfall_active, rs_source_caps=rs_source_caps)
     return total_iron_ore, total_flux, total_burden
 
 
@@ -597,10 +702,20 @@ def _report_compensation(blend, df, iron_ores, fluxes, unavailable_iron, unavail
     total_burden_actual = sum(blend[m] for m in blend if m in df.index)
     if total_burden_actual > 0:
         iol_actual = blend.get("IOL_Fines", 0.0); bf_actual = blend.get("BF_Returns", 0.0)
-        diagnostics.append(f"\n   🔒 STRICT R/S BURDEN-PERCENT MANDATES: "
-                            f"IOL Fines = {iol_actual:.2f} kg ({iol_actual/total_burden_actual*100:.2f}%), "
-                            f"BF Returns = {bf_actual:.2f} kg ({bf_actual/total_burden_actual*100:.2f}%), "
-                            f"Combined R/S = {(iol_actual+bf_actual)/total_burden_actual*100:.2f}%.")
+        rs_actual = iol_actual + bf_actual
+        rs_target_pct = (IOL_FINES_NOMINAL_PCT + BF_RETURNS_NOMINAL_PCT) * 100.0
+        rs_actual_pct = rs_actual / total_burden_actual * 100.0
+        diagnostics.append(
+            f"\n   🔄 R/S TARGET / ACTUAL: "
+            f"IOL Fines = {iol_actual:.2f} kg ({iol_actual/total_burden_actual*100:.2f}%), "
+            f"BF Returns = {bf_actual:.2f} kg ({bf_actual/total_burden_actual*100:.2f}%), "
+            f"Combined R/S = {rs_actual_pct:.2f}% (normal target {rs_target_pct:.2f}%)."
+        )
+        if mandate_reasons:
+            diagnostics.append(
+                "   ⚠️ R/S SHORTFALL: unavailable/insufficient R/S was not forced. "
+                "The missing quantity was made available for iron-bearing compensation."
+            )
     if mandate_reasons:
         diagnostics.append(f"\n   🔗 NOTE: {', '.join(mandate_reasons)} shortfall detected.")
     if iron_tier == "crisis" or flux_tier == "crisis":
@@ -799,21 +914,51 @@ def solve_blend_with_compensation(df, production_tonnes, targets, baseline_blend
         diagnostics = ["🚫 PRODUCTION IMPOSSIBLE: Fuel requirement cannot be met."] + [f"   {p}" for p in fuel_problems]
         return "No_Production", None, None, None, diagnostics, False
 
+    # Build inventory-aware R/S shortfall information before selecting the
+    # iron-ore compensation tier.
+    rs_info = get_rs_shortfall_info(
+        df, production_tonnes, iol_nominal=iol_nominal, bf_nominal=bf_nominal
+    )
+    rs_shortfall_active = (
+        RS_SHORTFALL_COMPENSATION_ENABLED and rs_info["active"]
+    )
+    rs_source_caps = {
+        "IOL_Fines": rs_info["iol_capacity_kg_t"],
+        "BF_Returns": rs_info["bfr_capacity_kg_t"],
+    }
+
     mandate_reasons = []
     for mat, nominal in [("IOL_Fines", iol_nominal), ("BF_Returns", bf_nominal)]:
         if mat not in df.index:
             mandate_reasons.append(f"{mat} missing from chemistry master")
-        elif df.loc[mat, "Available_Tonnes"] <= 0:
-            mandate_reasons.append(f"{mat} unavailable (strict requirement is {nominal*100:.1f}% of total burden)")
-        elif df.loc[mat, "Tech_Max"] <= 0:
-            mandate_reasons.append(f"{mat} Tech_Max is zero (strict requirement is {nominal*100:.1f}% of total burden)")
+        elif rs_shortfall_active:
+            cap = rs_source_caps.get(mat, 0.0)
+            target = nominal * 1000.0
+            if cap + RS_SHORTFALL_TOLERANCE_KG_T < target:
+                mandate_reasons.append(
+                    f"{mat} shortfall {target-cap:.1f} kg/t "
+                    f"(usable {cap:.1f} vs target {target:.1f} kg/t)"
+                )
 
-    iron_ore_max_pct, unavailable_iron, iron_msg, iron_tier = get_iron_ore_tier(df, iron_ores)
+    # A Return Sinter shortfall is an additional iron-bearing compensation
+    # trigger. Existing unavailable iron ores are counted as before.
+    extra_missing = 1 if rs_shortfall_active else 0
+    extra_reasons = list(mandate_reasons) if rs_shortfall_active else []
+    iron_ore_max_pct, unavailable_iron, iron_msg, iron_tier = get_iron_ore_tier(
+        df, iron_ores, extra_missing=extra_missing, extra_reasons=extra_reasons
+    )
     flux_max_pct, unavailable_flux, flux_msg, flux_tier = get_flux_tier(df, fluxes)
 
     diagnostics = [iron_msg, flux_msg]
+    if rs_shortfall_active:
+        diagnostics.append(
+            f"⚠️ R/S SHORTFALL COMPENSATION ACTIVE — target {rs_info['rs_target_kg_t']:.1f} kg/t "
+            f"({rs_info['rs_target_kg_t']/10:.1f}%), usable R/S {rs_info['rs_available_kg_t']:.1f} kg/t "
+            f"({rs_info['rs_available_kg_t']/10:.1f}%), shortfall {rs_info['rs_shortfall_kg_t']:.1f} kg/t "
+            f"({rs_info['rs_shortfall_kg_t']/10:.1f}%)."
+        )
     if mandate_reasons:
-        diagnostics += ["⚠️ MANDATE AVAILABILITY ISSUE — production-continuity mode is active."] + [f"   {r}" for r in mandate_reasons]
+        diagnostics += ["⚠️ R/S AVAILABILITY ISSUE — production-continuity compensation is active."] + [f"   {r}" for r in mandate_reasons]
 
     bounds = build_bounds(df, production_tonnes)
     if unavailable_iron:
@@ -846,13 +991,33 @@ def solve_blend_with_compensation(df, production_tonnes, targets, baseline_blend
 
     def _add_recovery_mandate_constraints(prob, x):
         total_burden = pulp.lpSum(x[m] for m in df.index)
+        if rs_shortfall_active:
+            if "IOL_Fines" in x:
+                prob += x["IOL_Fines"] == min(
+                    rs_source_caps.get("IOL_Fines", 0.0), iol_nominal * OUT
+                ), "IOL_Fines_Recovery_RS_Shortfall"
+            if "BF_Returns" in x:
+                prob += x["BF_Returns"] == min(
+                    rs_source_caps.get("BF_Returns", 0.0), bf_nominal * OUT
+                ), "BF_Returns_Recovery_RS_Shortfall"
+            return
+
         for mat, nominal in [("IOL_Fines", iol_nominal), ("BF_Returns", bf_nominal)]:
-            if mat not in x: continue
-            available = df.loc[mat, "Available_Tonnes"] > 0 and df.loc[mat, "Tech_Max"] > 0
+            if mat not in x:
+                continue
+            available = _rs_source_is_available(df, mat)
             if available:
                 prob += x[mat] == nominal * total_burden, f"{mat}_Recovery_Strict"
             else:
                 prob += x[mat] == 0, f"{mat}_Recovery_Unavailable"
+
+        if "IOL_Fines" in x and "BF_Returns" in x:
+            combined_nominal = iol_nominal + bf_nominal
+            prob += (
+                x["IOL_Fines"] + x["BF_Returns"]
+                == combined_nominal * total_burden
+            ), "RETURN_SINTER_TOTAL_RECOVERY_STRICT"
+
 
     def _fuel_q_expr(x):
         return pulp.lpSum(x[m] * (fuel_fc[m] / 100) * fuel_cv[m] for m in fuels if m in x)
@@ -888,7 +1053,8 @@ def solve_blend_with_compensation(df, production_tonnes, targets, baseline_blend
                                     flux_min_pct_override=flux_min_pct_override, mandate_mode=mandate_mode,
                                     iol_nominal=iol_nominal, bf_nominal=bf_nominal, iol_fb_min=iol_fb_min,
                                     iol_fb_max=iol_fb_max, bf_fb_min=bf_fb_min, bf_fb_max=bf_fb_max,
-                                    fuel_ash_settings=fuel_ash_settings)
+                                    fuel_ash_settings=fuel_ash_settings,
+                                    rs_shortfall_active=rs_shortfall_active, rs_source_caps=rs_source_caps)
         _add_fuel_split_constraint(prob, x, tag_suffix=f"_{tag}")
         Fe_sum, SiO2_sum, Al2O3_sum, CaO_sum, MgO_sum = _lp_chemistry_sums(x, df, fuel_ash_settings)
         prob += Fe_sum >= fe_lo, "Fe_min_hard"
@@ -1040,20 +1206,20 @@ def solve_blend_with_compensation(df, production_tonnes, targets, baseline_blend
     if shortage_targets is not None:
         probC, xC, statusC = _build_and_solve(FLUX_MIN_PCT_QUALITY_RELAXED, "quality_relaxed", "C", use_targets=shortage_targets, mandate_mode="pinned")
         if statusC == "Optimal":
-            return _finalize(probC, xC, "C", "✅ Resolved with widened ceilings – mandates pinned.")
+            return _finalize(probC, xC, "C", "✅ Resolved with widened ceilings – R/S shortfall compensated where required.")
 
     probD, xD, statusD = _build_and_solve(None, flux_tier, "D", mandate_mode="pinned")
     if statusD == "Optimal":
-        return _finalize(probD, xD, "D", "✅ Solved with chemistry relaxation; IOL/BF mandates remained strict.")
+        return _finalize(probD, xD, "D", "✅ Solved with chemistry relaxation; R/S shortfall compensation remained active where required.")
 
     probE, xE, statusE = _build_and_solve(FLUX_MIN_PCT_QUALITY_RELAXED, "quality_relaxed", "E", mandate_mode="pinned")
     if statusE == "Optimal":
-        return _finalize(probE, xE, "E", "✅ Solved with relaxed chemistry/flux floors; IOL/BF mandates remained strict.")
+        return _finalize(probE, xE, "E", "✅ Solved with relaxed chemistry/flux floors; R/S shortfall compensation remained active where required.")
 
     if shortage_targets is not None:
         probF, xF, statusF = _build_and_solve(FLUX_MIN_PCT_QUALITY_RELAXED, "quality_relaxed", "F", use_targets=shortage_targets, mandate_mode="pinned")
         if statusF == "Optimal":
-            return _finalize(probF, xF, "F", "✅ Solved using permitted chemistry relaxations; IOL/BF mandates remained strict.")
+            return _finalize(probF, xF, "F", "✅ Solved using permitted chemistry relaxations; R/S shortfall compensation remained active where required.")
 
     if PRODUCTION_CONTINUITY_MODE:
         diagnostics.append("🟡 Production-continuity recovery: searching for a quality-compliant blend at higher cost if necessary.")
@@ -1064,7 +1230,8 @@ def solve_blend_with_compensation(df, production_tonnes, targets, baseline_blend
                                     flux_min_pct_override=FLUX_MIN_PCT_QUALITY_RELAXED, mandate_mode="recovery",
                                     iol_nominal=iol_nominal, bf_nominal=bf_nominal, iol_fb_min=iol_fb_min,
                                     iol_fb_max=iol_fb_max, bf_fb_min=bf_fb_min, bf_fb_max=bf_fb_max,
-                                    fuel_ash_settings=fuel_ash_settings)
+                                    fuel_ash_settings=fuel_ash_settings,
+                                    rs_shortfall_active=rs_shortfall_active, rs_source_caps=rs_source_caps)
         for cname in ["IOL_Fines_STRICT_BURDEN_PCT", "BF_Returns_STRICT_BURDEN_PCT"]:
             if cname in probR.constraints: del probR.constraints[cname]
         _add_recovery_mandate_constraints(probR, xR)
@@ -1104,7 +1271,8 @@ def solve_blend_with_compensation(df, production_tonnes, targets, baseline_blend
                                 flux_min_pct_override=FLUX_MIN_PCT_QUALITY_RELAXED, mandate_mode="pinned",
                                 iol_nominal=iol_nominal, bf_nominal=bf_nominal, iol_fb_min=iol_fb_min,
                                 iol_fb_max=iol_fb_max, bf_fb_min=bf_fb_min, bf_fb_max=bf_fb_max,
-                                fuel_ash_settings=fuel_ash_settings)
+                                fuel_ash_settings=fuel_ash_settings,
+                                rs_shortfall_active=rs_shortfall_active, rs_source_caps=rs_source_caps)
     _add_diagnostic_coke_constraints(prob1, x1, suffix="_p1")
     slacks1, sums1 = build_soft_vars_and_constraints(prob1, x1, df, OUT, targets, fe_lo, fe_hi, suffix="_p1", fuel_ash_settings=fuel_ash_settings)
     obj1 = weighted_deviation_expr(slacks1, targets, OUT)
@@ -1133,7 +1301,8 @@ def solve_blend_with_compensation(df, production_tonnes, targets, baseline_blend
                                 flux_min_pct_override=FLUX_MIN_PCT_QUALITY_RELAXED, mandate_mode="pinned",
                                 iol_nominal=iol_nominal, bf_nominal=bf_nominal, iol_fb_min=iol_fb_min,
                                 iol_fb_max=iol_fb_max, bf_fb_min=bf_fb_min, bf_fb_max=bf_fb_max,
-                                fuel_ash_settings=fuel_ash_settings)
+                                fuel_ash_settings=fuel_ash_settings,
+                                rs_shortfall_active=rs_shortfall_active, rs_source_caps=rs_source_caps)
     _add_diagnostic_coke_constraints(prob2, x2, suffix="_p2")
     slacks2, sums2 = build_soft_vars_and_constraints(prob2, x2, df, OUT, targets, fe_lo, fe_hi, suffix="_p2", fuel_ash_settings=fuel_ash_settings)
     for key, var in slacks2.items():
@@ -1400,7 +1569,7 @@ def solve_manual_scenario(df, production_tonnes, targets, baseline_blend, fixed,
     """Manual Burden Control 'practical scenario': pin the user-changed materials
     at their requested kg/t and let the LP re-optimize everything else within
     the normal model constraints (availability, chemistry, Tech Min/Max, coke/
-    thermal limits, IOL/BF mandates unchanged)."""
+    thermal limits, R/S targets retained where physically available; shortfalls compensated)."""
     scenario_df = df.copy(deep=True)
 
     # Pandas 2.x/3.x can reject scalar assignments when the imported master
