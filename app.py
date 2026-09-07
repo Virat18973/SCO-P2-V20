@@ -79,7 +79,7 @@ if "master_df" not in st.session_state:
     st.session_state.changed_source = ""
     st.session_state.nav = "Dashboard"
 
-if "om_cost" not in st.session_state: st.session_state.om_cost = _backend_default("DEFAULT_OM_COST_RS_T", 1500.0)
+if "om_cost" not in st.session_state: st.session_state.om_cost = _backend_default("DEFAULT_OM_COST_RS_T", 750.0)
 if "coke_cv" not in st.session_state: st.session_state.coke_cv = _backend_default("DEFAULT_COKE_CV_KCAL_KG", 6800.0)
 if "coke_fc" not in st.session_state: st.session_state.coke_fc = _backend_default("DEFAULT_COKE_FC_PCT", 71.35)
 if "latent_heat" not in st.session_state: st.session_state.latent_heat = _backend_default("DEFAULT_HEAT_LATENT_MOISTURE", 540.0)
